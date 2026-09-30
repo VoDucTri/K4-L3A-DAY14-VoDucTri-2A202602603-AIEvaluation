@@ -12,7 +12,10 @@ import json
 import math
 import os
 import re
+import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -21,7 +24,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+
+if sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
+
+try:
+    from openai import OpenAI, OpenAIError
+except ImportError:
+    OpenAI = None  # type: ignore
+    OpenAIError = Exception  # type: ignore
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -242,6 +255,75 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            f"?key={self.api_key}"
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        max_retries = 6
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace")
+                last_error = RuntimeError(f"Gemini API error ({exc.code}): {err_body}")
+                if exc.code in (429, 503) and attempt < max_retries - 1:
+                    sleep_time = (2 ** attempt) + 2
+                    time.sleep(sleep_time)
+                    continue
+                raise last_error from exc
+            except Exception as exc:
+                last_error = RuntimeError(f"Gemini request failed: {exc}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                raise last_error from exc
+        else:
+            raise last_error or RuntimeError("Gemini request failed after max retries")
+
+        candidates = result.get("candidates", [])
+        if not candidates:
+            feedback = result.get("promptFeedback")
+            raise RuntimeError(f"Gemini returned no candidates. Prompt feedback: {feedback}")
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            raise RuntimeError("Gemini returned empty parts in candidate")
+        answer = parts[0].get("text", "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -250,6 +332,8 @@ class OpenAIGenerator:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
+        if OpenAI is None:
+            raise RuntimeError("openai package is not installed")
         self.client = OpenAI(api_key=api_key)
         self.max_output_tokens = max_output_tokens
 
@@ -296,10 +380,15 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            if os.getenv("GEMINI_API_KEY"):
+                generator = GeminiGenerator()
+            else:
+                generator = OpenAIGenerator()
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 
@@ -405,6 +494,17 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    existing_answers_map = {}
+    output_path = Path("artifacts/actual_answers.json")
+    if output_path.is_file():
+        try:
+            cached_data = json.loads(output_path.read_text(encoding="utf-8"))
+            for ans in cached_data.get("answers", []):
+                if ans.get("id") and ans.get("actual_answer"):
+                    existing_answers_map[ans["id"]] = ans
+        except Exception:
+            pass
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
         percentage = index / total
@@ -420,6 +520,11 @@ def generate_actual_answers(
         )
 
         started_at = time.perf_counter()
+        if item["id"] in existing_answers_map:
+            answers.append(existing_answers_map[item["id"]])
+            notify(f"[{bar_before}] {index:02d}/{total:02d} | {item['id']} Cached")
+            continue
+
         try:
             response = assistant.answer_with_trace(item["question"])
         except Exception:
@@ -444,6 +549,25 @@ def generate_actual_answers(
             }
         )
 
+        # Write intermediate artifact
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        interim_artifact = {
+            "schema_version": "1.0",
+            "corpus_id": assistant.corpus_id,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "agent": {
+                "name": "domain-assistant",
+                "model": model,
+                "top_k": top_k,
+                "prompt_version": "1.0",
+            },
+            "answers": answers,
+        }
+        output_path.write_text(
+            json.dumps(interim_artifact, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
         elapsed = time.perf_counter() - started_at
@@ -451,6 +575,7 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(1.0)
 
     return {
         "schema_version": "1.0",
